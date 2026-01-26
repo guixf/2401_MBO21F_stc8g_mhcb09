@@ -1,0 +1,2 @@
+# 2401_XY-MBO21F_stc8g_mhcb09
+2401_XY-MBO21F_stc8g_mhcb09人在、手机在多功能监测报告米家
