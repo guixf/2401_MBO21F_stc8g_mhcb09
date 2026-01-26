@@ -1,0 +1,545 @@
+/******************************************************************************
+ * 程序名称：STC8G1K17 人体感应控制系统
+ * 功能描述：
+ *  1. 使用掉电模式降低功耗
+ *  2. 通过PIR红外传感器(P3.3)唤醒系统
+ *  3. 实现逻辑一：有人时打开设备
+ *  4. 实现逻辑二：无人时关闭设备
+ *  5. 实现电压检测：低电压时打开充电
+ * 
+ * 时间参数：
+ *  t_delay - 延时时间(0.8s)
+ *  t_pulse - 脉冲时间(0.5s)
+ *  t_check - 检测间隔(1s)
+ * 
+ * 重复次数：
+ *  retry_count1 - 逻辑一重复次数
+ *  retry_count2 - 逻辑二重复次数
+ * 
+ * 电压阈值：
+ *  voltage_threshold - 芯片电压阈值(3V)
+ * 
+ * 继电器状态反馈（系统反馈打开时为高电平）：
+ *  relay1_open_level  - relay1打开时的电平
+ *  relay2_open_level  - relay2打开时的电平
+ *  relay3_open_level  - relay3打开时的电平
+ * 
+ * IO口定义：
+ *  P3.1,P3.0 - 刷机口
+ *  P3.2      - 2410s输入(高电平:有人, 低电平:无人)
+ *  P3.3      - PIR红外传感器(高电平:有人, 上升沿唤醒)
+ *  P3.4      - led1状态(低电平:led1亮)
+ *  P3.5      - led2状态(低电平:led2亮)
+ *  P3.6      - relay1状态反馈(默认低,系统打开时高)
+ *  P3.7      - relay2状态反馈(默认低,系统打开时高)
+ *  P1.4      - relay3状态反馈(默认低,系统打开时高)
+ * 
+ * 输出控制：
+ *  P5.5      - 芯片供电开关(默认高电平)
+ *  P5.4      - 控制hmcb09p的key1(默认高电平)
+ *  P1.7      - 控制hmcb09p的key2(默认高电平)
+ *  P1.5      - 控制hmcb09p的key3(默认高电平)
+ * 
+ * 开发环境：STC8G1K17
+ * 编译工具：SDCC
+ * 作者：[您的姓名]
+ * 日期：[当前日期]
+ ******************************************************************************/
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "stc8g.h"
+
+// ==================== 可调节参数 ====================
+// 时间参数（单位：毫秒）
+#define t_delay       800  // 0.8秒延时
+#define t_pulse       500  // 0.5秒脉冲
+#define t_check       1000 // 1秒检测间隔
+
+// 重复次数
+#define retry_count1  3    // 逻辑一重复次数
+#define retry_count2  3    // 逻辑二重复次数
+
+// 电压阈值（单位：V）
+#define voltage_threshold 3.0  // 3V阈值
+#define REF_VOLTAGE 3300        // ADC参考电压，3.3V in millivolts
+
+// 继电器状态反馈电平（系统反馈打开时的电平）
+#define relay1_open_level  1  // 1=高电平，0=低电平
+#define relay2_open_level  1  // 1=高电平，0=低电平
+#define relay3_open_level  1  // 1=高电平，0=低电平
+
+// 调试模式（1=启用，0=禁用）
+#define DEBUG_MODE 0
+
+// ==================== IO口定义（SDCC风格） ====================
+// SDCC使用不同的方式来定义SFR位
+
+// 输入端口位定义
+#define PIR_IN_BIT      3  // P3.3
+#define SENSOR_IN_BIT   2  // P3.2
+#define LED1_IN_BIT     4  // P3.4
+#define LED2_IN_BIT     5  // P3.5
+#define RELAY1_FB_BIT   6  // P3.6
+#define RELAY2_FB_BIT   7  // P3.7
+#define RELAY3_FB_BIT   4  // P1.4
+
+#define PIR_IN          P33
+#define SENSOR_IN       P32
+#define LED1_IN         P34
+#define LED2_IN         P35
+#define RELAY1_FB       P36
+#define RELAY2_FB       P37
+#define RELAY3_FB       P14
+
+#define POWER_CTRL      P55
+#define KEY1_OUT        P54
+#define KEY2_OUT        P17
+#define KEY3_OUT        P15
+
+// 输出端口位定义
+#define POWER_CTRL_BIT  5  // P5.5
+#define KEY1_OUT_BIT    4  // P5.4
+#define KEY2_OUT_BIT    7  // P1.7
+#define KEY3_OUT_BIT    5  // P1.5
+
+// ==================== 全局变量 ====================
+bool bLVD_Flag = false;     // LVD中断标志
+bool lvd_alert_flag = false; // 低电压报警标志
+
+// ==================== 函数声明 ====================
+void DelayMS(uint16_t ms);
+void Enter_PowerDown(void);
+void Exit_PowerDown(void);
+void Init_GPIO(void);
+void Init_Interrupt(void);
+void Init_LVD(void);
+void Power_On_Devices(void);
+void Send_Pulse_Key12(void);
+void Send_Pulse_Key3(void);
+bool Check_Relay1_Open(void);
+bool Check_Relay1_Close(void);
+bool Check_Relay3_Open(void);
+bool Check_Relay3_Close(void);
+float Get_Chip_Voltage(void);
+void Logic1_Process(void);
+void Logic2_Process(void);
+void LVD_Process(void);
+
+// ==================== 延时函数 ====================
+void DelayMS(uint16_t ms)
+{
+    uint16_t i, j;
+    for(i = 0; i < ms; i++)
+        for(j = 0; j < 1000; j++);
+}
+
+// ==================== 主函数 ====================
+void main(void)
+{
+    // 初始化
+    Init_GPIO();
+    Init_Interrupt();
+    Init_LVD();
+    
+    // 初始状态设置
+    P5 |= (1 << POWER_CTRL_BIT);   // 默认关闭供电
+    P5 |= (1 << KEY1_OUT_BIT);     // 默认高电平
+    P1 |= (1 << KEY2_OUT_BIT);     // 默认高电平
+    P1 |= (1 << KEY3_OUT_BIT);     // 默认高电平
+    
+    // 允许LVD中断
+    IE2 |= 0x40;     // 使能LVD中断
+    EA = 1;          // 开启总中断
+    
+    while(1)
+    {
+        // 检查LVD中断标志
+        if(bLVD_Flag)
+        {
+            bLVD_Flag = false;
+            LVD_Process();
+        }
+        
+        // 检测PIR信号，高电平表示有人
+        if(P3 & (1 << PIR_IN_BIT))
+        {
+            // 退出掉电模式
+            Exit_PowerDown();
+            
+            // 给后续芯片供电
+            Power_On_Devices();
+            
+            // 延时0.8s
+            DelayMS(t_delay);
+            
+            // 执行逻辑一：有人时打开设备
+            Logic1_Process();
+            
+            // 执行逻辑二：无人时关闭设备
+            Logic2_Process();
+            
+            // 准备进入掉电模式
+            // 等待PIR和传感器都无人
+            if(!(P3 & (1 << SENSOR_IN_BIT)) && !(P3 & (1 << PIR_IN_BIT)))
+            {
+                // 确认relay1已关闭
+                if(Check_Relay1_Close())
+                {
+                    DelayMS(1000);  // 延时1s
+                    Enter_PowerDown();  // 进入掉电模式
+                }
+            }
+        }
+        else
+        {
+            // 无人时进入掉电模式
+            Enter_PowerDown();
+        }
+    }
+}
+
+// ==================== 函数实现 ====================
+
+/**
+ * @brief  进入掉电模式
+ */
+void Enter_PowerDown(void)
+{
+    PCON |= 0x02;  // 进入掉电模式
+    // 空操作，等待进入掉电模式
+    PCON = PCON;
+}
+
+/**
+ * @brief  退出掉电模式
+ */
+void Exit_PowerDown(void)
+{
+    // 退出掉电模式后的初始化
+    Init_GPIO();
+}
+
+/**
+ * @brief  初始化GPIO
+ */
+void Init_GPIO(void)
+{
+    // P3口设置
+    // P3.0, P3.1: 刷机口，保持默认
+    // P3.2: 2410s输入，设置为输入模式
+    // P3.3: PIR输入，设置为输入模式
+    // P3.4, P3.5: LED状态输入，设置为输入模式
+    // P3.6, P3.7: 继电器反馈输入，设置为输入模式
+    P3M0 = 0x00;
+    P3M1 = 0x00;
+    
+    // P5口设置
+    // P5.4: KEY1输出，推挽输出
+    // P5.5: 供电控制输出，推挽输出
+    P5M0 = 0x30;  // 0011 0000
+    P5M1 = 0x00;
+    
+    // P1口设置
+    // P1.4: RELAY3反馈输入，设置为输入模式
+    // P1.5: KEY3输出，推挽输出
+    // P1.7: KEY2输出，推挽输出
+    P1M0 = 0xA0;  // 1010 0000
+    P1M1 = 0x00;
+}
+
+/**
+ * @brief  初始化中断
+ */
+void Init_Interrupt(void)
+{
+    // 配置INT1 (P3.3) 为上升沿触发，用于唤醒
+    IT1 = 0;      // 1=下降沿，0=上升沿/下降沿
+    EX1 = 1;      // 使能INT1中断
+    PX1 = 1;      // 高优先级
+}
+
+/**
+ * @brief  初始化LVD（低电压检测）
+ */
+void Init_LVD(void)
+{
+#ifdef LVDCR
+    LVDCR = 0x00;               // 清空配置
+    LVDCR |= (0b100 << 1);      // 设置LVD阈值3.0V
+    LVDCR |= 0x01;              // 开启LVD功能
+    LVDCR |= 0x80;              // 开启LVD中断
+#endif
+    /* 如果平台没有 LVDCR（或编译器不支持对应中断向量），
+       我们至少确保 LVD 标志被清除并尽可能启用 LVD 中断位 */
+    PCON &= ~LVDF;              // 清除 LVD 标志位（可移植写法）
+#ifdef ELVD
+    RSTCFG = LVD3V0;            //使能3.0V时低压中断
+    ELVD = 1;                   // 开启LVD中断（如果存在）
+#endif
+}
+
+/**
+ * @brief  给后续芯片供电
+ */
+void Power_On_Devices(void)
+{
+    P5 &= ~(1 << POWER_CTRL_BIT);  // 拉低，打开供电
+}
+
+/**
+ * @brief  发送KEY1和KEY2的脉冲（0.5s低电平）
+ */
+void Send_Pulse_Key12(void)
+{
+    P5 &= ~(1 << KEY1_OUT_BIT);
+    P1 &= ~(1 << KEY2_OUT_BIT);
+    DelayMS(t_pulse);
+    P5 |= (1 << KEY1_OUT_BIT);
+    P1 |= (1 << KEY2_OUT_BIT);
+}
+
+/**
+ * @brief  发送KEY3的脉冲（0.5s低电平）
+ */
+void Send_Pulse_Key3(void)
+{
+    P1 &= ~(1 << KEY3_OUT_BIT);
+    DelayMS(t_pulse);
+    P1 |= (1 << KEY3_OUT_BIT);
+}
+
+/**
+ * @brief  检查Relay1是否打开
+ * @return true=已打开，false=未打开
+ */
+bool Check_Relay1_Open(void)
+{
+    bool pin_state = (P3 & (1 << RELAY1_FB_BIT)) != 0;
+    
+    if(relay1_open_level == 1)
+        return pin_state;
+    else
+        return !pin_state;
+}
+
+/**
+ * @brief  检查Relay1是否关闭
+ * @return true=已关闭，false=未关闭
+ */
+bool Check_Relay1_Close(void)
+{
+    bool pin_state = (P3 & (1 << RELAY1_FB_BIT)) != 0;
+    
+    if(relay1_open_level == 1)
+        return !pin_state;
+    else
+        return pin_state;
+}
+
+/**
+ * @brief  检查Relay3是否打开
+ * @return true=已打开，false=未打开
+ */
+bool Check_Relay3_Open(void)
+{
+    bool pin_state = (P1 & (1 << RELAY3_FB_BIT)) != 0;
+    
+    if(relay3_open_level == 1)
+        return pin_state;
+    else
+        return !pin_state;
+}
+
+/**
+ * @brief  检查Relay3是否关闭
+ * @return true=已关闭，false=未关闭
+ */
+bool Check_Relay3_Close(void)
+{
+    bool pin_state = (P1 & (1 << RELAY3_FB_BIT)) != 0;
+    
+    if(relay3_open_level == 1)
+        return !pin_state;
+    else
+        return pin_state;
+}
+
+/**
+ * @brief  获取芯片电压（简化版本，需要根据实际ADC配置）
+ * @return 电压值（单位：V）
+ */
+float Get_Chip_Voltage(void)
+{
+    uint16_t adc_value, voltage;
+    // 启动ADC转换
+    //ADC_CONTR |= 0x08;
+    ADC_CONTR |= 0x40;
+    while(!(ADC_CONTR & 0x20)); // 等待转换完成
+    ADC_CONTR &= ~0x20;         // 清除转换标志
+    
+    // 计算12位ADC值
+    adc_value = (uint16_t)ADC_RES << 4;
+    adc_value |= ADC_RESL & 0x0F;
+    
+    // 计算电压：VCC = 参考电压 * 4096 / ADC值
+    if(adc_value != 0)
+    {
+        voltage = (uint32_t)REF_VOLTAGE * 4096 / adc_value;
+    }
+    else
+    {
+        voltage = 0;
+    }
+    return voltage;
+}
+
+/**
+ * @brief  逻辑一处理：有人时打开设备
+ */
+void Logic1_Process(void)
+{
+    uint8_t i;
+    
+    // 逻辑一：P3.2为高电平（有人）且relay1为关闭
+    if((P3 & (1 << SENSOR_IN_BIT)) && Check_Relay1_Close())
+    {
+        // 发送脉冲
+        Send_Pulse_Key12();
+        
+        // 1秒后检测
+        DelayMS(t_check);
+        
+        // 检查是否打开，未打开则重试
+        i = 0;
+        while(!Check_Relay1_Open() && i < retry_count1)
+        {
+            Send_Pulse_Key12();
+            DelayMS(t_check);
+            i++;
+        }
+        
+        // 检查relay3是否打开，且电压高于阈值
+        if(Check_Relay3_Open())
+        {
+            float voltage = Get_Chip_Voltage();
+            if(voltage >= voltage_threshold)
+            {
+                // 发送KEY3脉冲关闭relay3
+                Send_Pulse_Key3();
+                DelayMS(t_check);
+                
+                // 检查是否关闭，未关闭则重试
+                i = 0;
+                while(!Check_Relay3_Close() && i < retry_count1)
+                {
+                    Send_Pulse_Key3();
+                    DelayMS(t_check);
+                    i++;
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief  逻辑二处理：无人时关闭设备
+ */
+void Logic2_Process(void)
+{
+    uint8_t i;
+    
+    // 逻辑二：P3.2和P3.3都为低电平（无人）且relay1为打开
+    if(!(P3 & (1 << SENSOR_IN_BIT)) && !(P3 & (1 << PIR_IN_BIT)) && Check_Relay1_Open())
+    {
+        // 发送脉冲
+        Send_Pulse_Key12();
+        
+        // 1秒后检测
+        DelayMS(t_check);
+        
+        // 检查是否关闭，未关闭则重试
+        i = 0;
+        while(!Check_Relay1_Close() && i < retry_count2)
+        {
+            Send_Pulse_Key12();
+            DelayMS(t_check);
+            i++;
+        }
+    }
+}
+
+/**
+ * @brief  LVD处理：低电压时打开充电
+ */
+void LVD_Process(void)
+{
+    uint8_t i;
+    
+    // LVD中断：芯片电压低于3V且relay3为关闭
+    if(Get_Chip_Voltage() < voltage_threshold && Check_Relay3_Close())
+    {
+        // 发送KEY3脉冲打开relay3
+        Send_Pulse_Key3();
+        DelayMS(t_check);
+        
+        // 检查是否打开，未打开则重试
+        i = 0;
+        while(!Check_Relay3_Open() && i < retry_count1)
+        {
+            Send_Pulse_Key3();
+            DelayMS(t_check);
+            i++;
+        }
+    }
+}
+
+/* LVD 中断：一些工具链/平台不支持自定义较高的中断号（例如 'interrupt 26'），
+   因此我们不在这里强制定义带数字的 ISR，以免编译失败。若目标平台支持，
+   可以在此处添加相应带向量号的 ISR 定义。 */
+#ifndef LVD_ISR_DEFINED
+static inline void LVD_HandleFlag(void)
+{
+    if(PCON & LVDF)
+    {
+        lvd_alert_flag = 1; // 设置低电压标志
+        PCON &= ~LVDF;      // 清除中断标志
+    }
+}
+#endif
+
+// ADC初始化：采集内部参考电压，12位精度
+void ADC_Init(void)
+{
+#ifdef P1ASF
+    P1ASF = 0x00;               // P1口不作为ADC口
+#endif
+    ADC_CONTR = 0x80;           // 开启ADC电源
+    ADC_RES = 0;                // 清空结果寄存器
+    ADC_RESL = 0;
+    DelayMS(2);                // ADC电源稳定
+    ADC_CONTR |= 0x0f;          // 选择内部参考电压通道(CH15)
+    //ADC_CONTR |= 0x40;          // 12位ADC精度
+} 
+
+
+// ==================== 中断服务函数 ====================
+
+/**
+ * @brief  INT1中断服务函数（P3.3）
+ */
+void INT1_ISR(void) __interrupt(2)
+{
+    EX1 = 0;  // 暂时关闭中断，防止重复触发
+    // 中断处理代码
+    EX1 = 1;  // 重新开启中断
+}
+
+/**
+ * @brief  LVD中断服务函数
+ */
+void LVD_ISR(void) __interrupt(10)
+{
+    PCON &= ~LVDF;      // 清除中断标志
+    bLVD_Flag = true; // 设置标志位，在主循环中处理
+}
