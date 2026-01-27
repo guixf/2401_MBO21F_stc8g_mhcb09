@@ -39,6 +39,18 @@ SFR(LVDCR, 0xFD);
 #define BAUDRATE           115200  // 串口波特率
 #define FOSC               24000000// 晶振频率（24MHz）
 
+// 预设POWER_CTRL行为：
+//  - 1 = 强制断电（`POWER_CTRL` 始终为0）
+//  - 0 = 保持程序原有逻辑
+#define PRESET_POWER_CTRL  0
+
+// 统一设置电源的宏，避免到处直接写 POWER_CTRL = x
+#if PRESET_POWER_CTRL
+#define SET_POWER(x) (POWER_CTRL = 0)
+#else
+#define SET_POWER(x) (POWER_CTRL = (x))
+#endif
+
 /************************* IO口定义 *************************/
 // 输入口
 #define HUMAN_2410S_IN    P32     // 2410s人体检测
@@ -107,7 +119,7 @@ void main(void)
             Disable_INT1(); // 禁用INT1防重复触发
             
             // 唤醒后初始操作：P5.5置低 + 延时1s
-            POWER_CTRL = 0;         
+            SET_POWER(0);         
             Delay_ms(DELAY_1S);   
             
             // Relay1关闭则输出Key1脉冲
@@ -117,7 +129,7 @@ void main(void)
             }
             
             // P5.5置高 + 启动3秒计时器
-            POWER_CTRL = 1;         
+            SET_POWER(1);         
             Start_Timer3s(); // 启动定时器0计时
             Detect_Voltage_Status();                   // 先检测电压并串口输出
             if(DEBUG_MODE)
@@ -137,7 +149,7 @@ void main(void)
  
 
                     // P5.5置低 + 延时1秒
-                    POWER_CTRL = 0;         
+                    SET_POWER(0);         
                     Delay_ms(DELAY_1S);   
                     
                     /************************* 逻辑①：有人+Relay2关闭 → Key2脉冲 *************************/
@@ -166,7 +178,7 @@ void main(void)
                         // 检查掉电条件：P3.2+P3.3都低
                         if(Check_Exit_Condition())
                         {
-                            POWER_CTRL = 1;         
+                            SET_POWER(1);         
                             Delay_ms(DELAY_1S);     
                             Enable_INT1();          
                             Enter_PowerDown_Mode(); 
@@ -176,7 +188,7 @@ void main(void)
                     else
                     {
                         // 逻辑④不满足：重置并重启3秒计时器
-                        POWER_CTRL = 1;
+                        SET_POWER(1);
                         Reset_Timer3s();
                         Start_Timer3s();
                     }
@@ -270,7 +282,7 @@ void System_Init(void)
     P5M0 = (P5M0 & ~0x10) | 0x20; P5M1 &= ~0x30; // P5.4/5.5推挽输出
     
     // 输出口默认高电平
-    POWER_CTRL = 1;
+    SET_POWER(1);
     KEY1_OUT = 1;
     KEY2_OUT = 1;
     KEY3_OUT = 1;
