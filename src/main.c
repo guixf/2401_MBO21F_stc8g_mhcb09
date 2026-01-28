@@ -1,379 +1,459 @@
 /**************************************************************************************
- * 程序文档说明（V2.1 定时器计时版）
- * 1. 硬件平台：STC8G1K17单片机，晶振频率24MHz
+ * 程序文档说明（V2.0 最终版，使用定时器版本）
+ * 1. 硬件平台：STC8G1K17单片机，晶振频率24MHz，MHCB09P和HLK2401电源受控型
  * 2. 编译环境：VSCode + SDCC/STC官方编译器
- * 3. 核心更新：
- *    - 改用定时器0（16位1T模式）实现3秒精准计时（1ms中断一次，累计3000次=3秒）
- *    - 定时器计时不阻塞主逻辑，保证传感器/Relay状态实时检测
- *    - 保留所有V2.0业务逻辑：唤醒流程、Relay联动、掉电机制
- * 4. 核心逻辑：
- *    - P3.3上升沿唤醒 → P5.5置低→延时1s→Relay1→Key1→P5.5置高→启动定时器0计时3秒
- *    - 3秒计时完成→电压检测→P5.5置低→延时1s→执行Relay2/电压联动→根据结果重置计时/掉电
+ * 3. 功能描述：
+ *    - 基于2410s（P3.2）和PIR（P3.3）双人体传感器检测人员状态，P3.3上升沿中断唤醒掉电模式
+ *    - 集成CH15通道LVD+ADC电压检测
+ *    - P3.3中断防重复触发机制：唤醒后屏蔽中断，掉电前恢复中断
+ *    - 核心计时逻辑：唤醒后P5.5置低→延时0.5s→检测电压 → 标记电压高/低（调试模式串口输出）
+ *    - 精准控制HMBC09P芯片的Key1/Key2/Key3输出指定时长低脉冲，LED1→Key1、LED2→Key2、Relay3→Key3
+ *    - 低功耗设计：无人员活动时进入掉电模式，关闭MHCB09P和HLK2401电源，仅P3.3上升沿中断可唤醒
+ *    - 看门狗功能：防止程序跑飞，溢出时间约1秒，主循环定期喂狗，掉电模式自动休眠
+ *    - 调试模式：电源常开（P5.5初始低）+ 串口1初始化（115200波特率）+ 串口输出电压值；
+ *    - 非调试模式：电源按逻辑控制（初始高）+ 不初始化串口 + 不输出电压值
+ * 4. IO口定义及模式：
+ *    - 刷机/串口复用口：P3.1(TX1)、P3.0(RX1)（刷机时为下载口，运行时为串口1）
+ *    - 输入口（高阻模式）：
+ *      P3.2 - 2410s人体检测（下拉，默认低电平，高电平有人/低电平无人，下降沿触发中断）
+ *      P3.3 - PIR红外传感器（默认低电平，高电平有人，上升沿触发中断）
+ *      P3.4 - LED1状态（低电平亮）
+ *      P3.5 - LED2状态（低电平亮）
+ *      P1.3 - LED3状态（低电平亮）
+ *      P3.6 - Relay1反馈（默认低电平，高电平打开）
+ *      P3.7 - Relay2反馈（默认低电平，高电平打开）
+ *      P1.4 - Relay3反馈（默认低电平，高电平打开）
+ *    - 输出口（推挽输出模式，默认高电平）：
+ *      P5.5 - 2410s/HMBC09P供电开关，低电平为打开电源
+ *      P5.4 - HMBC09P Key1输出（LED1联动）
+ *      P1.7 - HMBC09P Key2输出（LED2联动）
+ *      P1.5 - HMBC09P Key3输出（Relay3电压联动）
+ * 5. 核心逻辑（V2.0 最终版）：
+ *    - P3.3上升沿触发中断 → 置位唤醒标志 + 屏蔽INT1中断 → 退出掉电模式 → 打开电源 → 延时0.5s→检测电压 → 标记电压高/低
+ *    - 循环：喂狗 → 如果LED1关闭 → Key1输出0.05s低脉冲
+ *    - 执行逻辑：
+ *      ① 有人（P3.2高）+ LED2关闭 → Key2输出0.05s低脉冲 
+ *      ③ 电压低+Relay3关闭 → Key3输出0.05s低脉冲；电压高+Relay3打开 → Key3输出0.05s低脉冲
+ *      ④ 无人（P3.2低）+ LED2打开 → Key2输出0.05s低脉冲→ 如果led1打开则Key1输出0.05s低脉冲；检查P3.2、P3.3是否为低：
+ *         - 满足：延时1s→关闭电源+恢复INT1→关闭看门狗→掉电→ 跳出当前循环；
+ *         - 不满足：继续循环
  **************************************************************************************/
 #include <STC8G.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>  // 串口打印需要的头文件
 
-// Additional SFR definitions for STC8G
+// ====================== 调试模式预定义开关（核心）======================
+#define DEBUG_MODE  // 调试模式开关：电源常开+串口输出；注释则关闭调试模式
+
+// 补充STC8G特殊功能寄存器定义
 #define _P1ASF 0x9D
 SFR(P1ASF, 0x9D);
 #define _LVDCR 0xFD
 SFR(LVDCR, 0xFD);
+// 看门狗寄存器定义（STC8G1K17）
+SFR(WDTCN, 0xE7); // 看门狗控制寄存器
 
 /************************* 可配置参数区 *************************/
-// 时间参数（单位：ms）
-#define DELAY_1S           1000    // 通用1秒延时
-#define DELAY_0_1S         50     // Key1/Key2低脉冲时长
-#define DELAY_0_5S         50     // Key3低脉冲时长
-#define TIMER_3S_COUNT     3000    // 3秒计时阈值（1ms中断×3000次）
-#define VOLTAGE_THRESHOLD  3000    // 电压阈值（3V）
-#define REF_VOLTAGE        1190    // 内部参考电压（1.19V）
+// 时间参数（ms）
+#define DELAY_WAKEUP       500     // 唤醒后延时（0.5s）
+#define DELAY_KEY_PULSE    50      // Key脉冲时长（0.05s）
+#define DELAY_POWER_OFF    1000    // 掉电前延时（1s）
+#define WDT_FEED_INTERVAL  500     // 看门狗喂狗间隔（0.5s，小于溢出时间）
 
-// Relay预设值
-#define RELAY1_OPEN_LEVEL  1       // Relay1打开时为高电平
-#define RELAY2_OPEN_LEVEL  0       // Relay2打开时为高电平
-#define RELAY3_OPEN_LEVEL  1       // Relay3打开时为高电平
+// 电压参数
+#define VOLTAGE_THRESHOLD  3000    // 电压阈值（3V，单位mV）
+#define REF_VOLTAGE        1190    // 内部参考电压（1.19V，可校准）
 
-// 调试+串口参数
-#define DEBUG_MODE         1       // 1=开启串口输出
-#define BAUDRATE           115200  // 串口波特率
-#define FOSC               24000000// 晶振频率（24MHz）
+// 硬件状态定义
+#define LED_ON_LEVEL       0       // LED亮的电平（低电平亮）
+#define RELAY3_OPEN_LEVEL  1       // Relay3打开的电平（高电平打开）
+#define POWER_ON_LEVEL     0       // P5.5低电平=打开电源
+#define POWER_OFF_LEVEL    1       // P5.5高电平=关闭电源
 
-// 预设POWER_CTRL行为：
-//  - 1 = 强制断电（`POWER_CTRL` 始终为0）
-//  - 0 = 保持程序原有逻辑
-#define PRESET_POWER_CTRL  0
+// 定时器参数（24MHz晶振，1ms中断一次）
+#define FOSC               24000000
+#define TIMER0_PRESCALER   1       // 1T模式
+#define TIMER0_RELOAD      (65536 - (FOSC / 1000 / TIMER0_PRESCALER)) // 1ms重载值
 
-// 统一设置电源的宏，避免到处直接写 POWER_CTRL = x
-#if PRESET_POWER_CTRL
-#define SET_POWER(x) (POWER_CTRL = 0)
-#else
-#define SET_POWER(x) (POWER_CTRL = (x))
-#endif
+// 串口参数（115200波特率，24MHz晶振）
+#define BAUDRATE           115200
 
 /************************* IO口定义 *************************/
-// 输入口
+// 输入口（高阻模式）
 #define HUMAN_2410S_IN    P32     // 2410s人体检测
 #define PIR_IN            P33     // PIR红外传感器
-#define RELAY1_FEEDBACK   P36     // Relay1反馈
-#define RELAY2_FEEDBACK   P37     // Relay2反馈
+#define LED1_STATUS       P34     // LED1状态（低亮）
+#define LED2_STATUS       P35     // LED2状态（低亮）
+#define LED3_STATUS       P13     // LED3状态（低亮）
+#define RELAY1_FEEDBACK   P36     // Relay1反馈（预留）
+#define RELAY2_FEEDBACK   P37     // Relay2反馈（预留）
 #define RELAY3_FEEDBACK   P14     // Relay3反馈
-#define LED1              P34     // led1反馈
-#define LED2              P35     // led2反馈
-#define LED3              P13     // led3反馈
-// 输出口
-#define POWER_CTRL        P55     // 2410s/HMBC09P供电控制
-#define KEY1_OUT          P54     // HMBC09P Key1输出
-#define KEY2_OUT          P17     // HMBC09P Key2输出
-#define KEY3_OUT          P15     // HMBC09P Key3输出
+
+// 输出口（推挽模式）
+#define POWER_CTRL        P55     // 电源控制（低电平开，高电平关）
+#define KEY1_OUT          P54     // Key1输出（LED1联动）
+#define KEY2_OUT          P17     // Key2输出（LED2联动）
+#define KEY3_OUT          P15     // Key3输出（Relay3电压联动）
 
 /************************* 全局变量 *************************/
-bool system_wakeup_flag = 0;      // 系统唤醒标志
-bool voltage_low_flag = 0;        // 低电压标记
-bool voltage_high_flag = 0;       // 高电压标记
-uint16_t timer_3s_cnt = 0;        // 3秒计时计数器（1ms累加）
-bool timer_3s_flag = 0;           // 3秒计时完成标志
-bool timer_3s_running = 0;        // 3秒计时器运行标志
+// 系统状态变量
+bool system_wakeup_flag = 0;      // 系统唤醒标志（P3.3中断触发）
+bool voltage_low_flag = 0;        // 低电压标记（1=低于阈值）
+bool voltage_high_flag = 0;       // 高电压标记（1=高于/等于阈值）
+uint32_t wdt_feed_timer = 0;      // 看门狗喂狗计时计数器
+
+// 定时器全局变量
+volatile uint32_t timer_ms = 0;   // 毫秒计时计数器（定时器中断累加）
 
 /************************* 函数声明 *************************/
-void UART1_Init(void);           // 串口初始化
-void System_Init(void);          // 系统初始化
+// 系统初始化
+void System_Init(void);          // 系统总初始化
 void Timer0_Init(void);          // 定时器0初始化（1ms中断）
-void LVD_ADC_Init(void);         // LVD+ADC初始化
-void Delay_ms(uint16_t ms);      // 毫秒延时
-void Enter_PowerDown_Mode(void); // 进入掉电模式
-void UART1_Send_Voltage(uint16_t volt);// 串口发送电压
-uint16_t Get_VCC_Voltage(void);  // 获取VCC电压
-void Detect_Voltage_Status(void);// 检测电压状态
-void Output_Key1_Pulse(void);    // Key1输出0.1s脉冲
-void Output_Key2_Pulse(void);    // Key2输出0.1s脉冲
-void Output_Key3_Pulse(void);    // Key3输出0.5s脉冲
-bool Check_Relay1_Status(void);   // 检测Relay1状态
-bool Check_Relay2_Status(void);   // 检测Relay2状态
-bool Check_Relay3_Status(void);   // 检测Relay3状态
-void Disable_INT1(void);         // 禁用INT1中断
-void Enable_INT1(void);          // 启用INT1中断
-bool Check_Exit_Condition(void); // 检查掉电条件
-void Start_Timer3s(void);        // 启动3秒计时器
-void Stop_Timer3s(void);         // 停止3秒计时器
-void Reset_Timer3s(void);        // 重置3秒计时器
+void UART1_Init(void);           // 串口1初始化（仅调试模式编译）
+void LVD_ADC_Init(void);         // LVD+ADC初始化（CH15通道）
+void WDT_Init(void);             // 看门狗初始化（溢出时间≈1秒）
+void WDT_Feed(void);             // 看门狗喂狗
+void WDT_Stop(void);             // 关闭看门狗
 
-/************************* 主函数 *************************/
+// 工具函数
+void Timer_Delay_ms(uint16_t ms); // 阻塞式毫秒延时（基于定时器）
+void UART1_SendChar(uint8_t ch);  // 串口发送单个字符
+void UART1_SendString(char *str); // 串口发送字符串
+void Print_Voltage(uint16_t volt);// 串口打印电压值（仅调试模式编译）
+
+// 核心功能函数
+void Enter_PowerDown_Mode(void); // 进入掉电模式
+uint16_t Get_VCC_Voltage(void);  // 获取VCC电压（mV）
+void Detect_Voltage_Status(void);// 检测电压状态并更新标记（调试模式串口输出）
+void Output_Key1_Pulse(void);    // Key1输出0.05s低脉冲
+void Output_Key2_Pulse(void);    // Key2输出0.05s低脉冲
+void Output_Key3_Pulse(void);    // Key3输出0.05s低脉冲
+bool Check_LED1_Status(void);    // 检测LED1状态（1=亮，0=灭）
+bool Check_LED2_Status(void);    // 检测LED2状态（1=亮，0=灭）
+bool Check_Relay3_Status(void);  // 检测Relay3状态（1=打开，0=关闭）
+void Disable_INT1(void);         // 禁用INT1中断（防重复触发）
+void Enable_INT1(void);          // 启用INT1中断（恢复唤醒）
+bool Check_Exit_Condition(void); // 检查掉电条件（P3.2+P3.3均低）
+
+/************************* 主函数（核心逻辑）*************************/
 void main(void)
 {
-    // 初始化：串口+系统+定时器+LVD/ADC
-    UART1_Init();
-    System_Init();
+    // 1. 系统初始化：定时器+IO+中断+ADC/LVD+看门狗（调试模式额外初始化串口）
     Timer0_Init();
-    LVD_ADC_Init();
+    System_Init();
+    WDT_Init();                   // 初始化看门狗
+    WDT_Feed();                   // 首次喂狗
     
-    // 初始进入掉电模式
+    // 2. 初始进入掉电模式（低功耗）
     Enter_PowerDown_Mode();
     
     while(1)
     {
-        // 仅当P3.3中断唤醒时执行逻辑
+        // 仅P3.3中断唤醒时执行逻辑
         if(system_wakeup_flag)
         {
-            system_wakeup_flag = 0;
-            Disable_INT1(); // 禁用INT1防重复触发
+            system_wakeup_flag = 0; // 清除唤醒标志
+            Disable_INT1();         // 屏蔽INT1中断，防止重复触发
+            WDT_Init();             // 唤醒后重新初始化看门狗
+            WDT_Feed();             // 唤醒后立即喂狗
+            wdt_feed_timer = 0;     // 重置喂狗计时器
             
-            // 唤醒后初始操作：P5.5置低 + 延时1s
-            SET_POWER(0);         
-            Delay_ms(DELAY_1S);   
+            // 唤醒后：打开电源（调试模式下始终保持打开，无需重复设置）
+#ifndef DEBUG_MODE
+            POWER_CTRL = POWER_ON_LEVEL;
+#endif
             
-            // Relay1关闭则输出Key1脉冲
-            if(Check_Relay1_Status() == 0)
-            {
-                Output_Key1_Pulse();
-            }
+            // 延时0.5秒（定时器精准实现）
+            Timer_Delay_ms(DELAY_WAKEUP);
             
-            // P5.5置高 + 启动3秒计时器
-            SET_POWER(1);         
-            Start_Timer3s(); // 启动定时器0计时
-            Detect_Voltage_Status();                   // 先检测电压并串口输出
-            if(DEBUG_MODE)
-                    {
-                        //UART1_Send_Voltage(Get_VCC_Voltage());
-                    }
-
-            // 核心业务循环
+            // 检测电压并标记高低（调试模式串口输出电压值）
+            Detect_Voltage_Status();
+            
+            // 核心循环：持续执行联动逻辑，直到满足掉电条件
             while(1)
             {
-                // 检测3秒计时完成标志
-                if(timer_3s_flag)
+                // 看门狗喂狗逻辑：每500ms喂一次狗
+                if(timer_ms - wdt_feed_timer >= WDT_FEED_INTERVAL)
                 {
-                    timer_3s_flag = 0; // 清除计时完成标志
-                    Stop_Timer3s();    // 停止计时器
+                    WDT_Feed();
+                    wdt_feed_timer = timer_ms;
+                }
+                
+                // 循环逻辑：LED1关闭 → Key1输出0.05s低脉冲
+                if(Check_LED1_Status() == 0)
+                {
+                    Output_Key1_Pulse();
+                }
+                
+                /************************* 执行逻辑①：有人+LED2关闭 → Key2脉冲 *************************/
+                if(HUMAN_2410S_IN == 1 && Check_LED2_Status() == 0)
+                {
+                    Output_Key2_Pulse();
+                }
+                
+                /************************* 执行逻辑③：电压联动Relay3 → Key3脉冲 *************************/
+                // 电压低 + Relay3关闭 → Key3脉冲
+                if(voltage_low_flag && Check_Relay3_Status() == 0)
+                {
+                    Output_Key3_Pulse();
+                }
+                // 电压高 + Relay3打开 → Key3脉冲
+                else if(voltage_high_flag && Check_Relay3_Status() == 1)
+                {
+                    Output_Key3_Pulse();
+                }
+                
+                /************************* 执行逻辑④：无人+LED2打开 → Key2脉冲+额外判断 *************************/
+                if(HUMAN_2410S_IN == 0 && Check_LED2_Status() == 1)
+                {
+                    // 无人+LED2打开 → Key2输出0.05s低脉冲
+                    Output_Key2_Pulse();
                     
- 
-
-                    // P5.5置低 + 延时1秒
-                    SET_POWER(0);         
-                    Delay_ms(DELAY_1S);   
-                    
-                    /************************* 逻辑①：有人+Relay2关闭 → Key2脉冲 *************************/
-                    if(HUMAN_2410S_IN == 1 && Check_Relay2_Status() == 0)
+                    // LED1打开 → Key1输出0.05s低脉冲
+                    if(Check_LED1_Status() == 1)
                     {
-                        Output_Key2_Pulse();
-                    }
-                    
-                    /************************* 逻辑③：电压联动Relay3 → Key3脉冲 *************************/
-                    if(voltage_low_flag && Check_Relay3_Status() == 0)
-                    {
-                        Output_Key3_Pulse();
-                    }
-                    else if(voltage_high_flag && Check_Relay3_Status() == 1)
-                    {
-                        Output_Key3_Pulse();
-                    }
-                    
-                    /************************* 逻辑④：无人+Relay2打开 → Key2脉冲 *************************/
-                    if(HUMAN_2410S_IN == 0 && Check_Relay2_Status() == 1)
-                    {
-                        Output_Key2_Pulse();
-
                         Output_Key1_Pulse();
-                        //UART1_Send_Voltage(Get_VCC_Voltage());
-                        // 检查掉电条件：P3.2+P3.3都低
-                        if(Check_Exit_Condition())
-                        {
-                            SET_POWER(1);         
-                            Delay_ms(DELAY_1S);     
-                            Enable_INT1();          
-                            Enter_PowerDown_Mode(); 
-                            break;
-                        }
                     }
-                    else
+                    
+                    // 检查掉电条件：P3.2（无人）+ P3.3（无PIR）均低
+                    if(Check_Exit_Condition())
                     {
-                        // 逻辑④不满足：重置并重启3秒计时器
-                        SET_POWER(1);
-                        Reset_Timer3s();
-                        Start_Timer3s();
+                        // 满足掉电条件：严格按文档顺序执行
+                        // 1. 延时1秒
+                        Timer_Delay_ms(DELAY_POWER_OFF);
+                        
+                        // 2. 关闭电源（仅非调试模式执行）
+#ifndef DEBUG_MODE
+                        POWER_CTRL = POWER_OFF_LEVEL;
+#endif
+                        
+                        // 3. 恢复INT1中断，允许下次唤醒
+                        Enable_INT1();
+                        
+                        // 4. 关闭看门狗 → 进入掉电模式（掉电模式下看门狗自动休眠）
+                        WDT_Stop();
+                        Enter_PowerDown_Mode();
                     }
                 }
                 
-                // 非计时阶段可执行其他实时检测逻辑（如传感器状态）
-                // 此处可扩展：实时检测P3.2/P3.3状态、Relay状态等
+                // 不满足掉电条件 → 继续循环
             }
         }
     }
 }
 
-/************************* 定时器0初始化（1ms中断）*************************/
-void Timer0_Init(void)
-{
-    TMOD &= 0xF0;    // 清空定时器0模式位
-    TMOD |= 0x01;    // 定时器0模式1（16位自动重装）
-    AUXR |= 0x80;    // 定时器0使用1T模式（不分频，24MHz下1个机器周期=1/24μs）
-    TH0 = 0xFF;      // 1ms定时初值（24MHz：(65536 - 24000) = 41536 → 0xFFCC）
-    TL0 = 0xCC;      
-    ET0 = 1;         // 开启定时器0中断
-    TR0 = 0;         // 初始停止定时器0
-    EA = 1;          // 开启总中断
-}
-
-/************************* 定时器0中断服务函数（1ms一次）*************************/
-void Timer0_ISR(void) __interrupt(1)
-{
-    // 重装初值（1ms）
-    TH0 = 0xFF;
-    TL0 = 0xCC;
-    
-    // 仅当计时器运行时累加
-    if(timer_3s_running)
-    {
-        timer_3s_cnt++;
-        // 累计3000次=3秒
-        if(timer_3s_cnt >= TIMER_3S_COUNT)
-        {
-            timer_3s_cnt = 0;
-            timer_3s_flag = 1; // 置位3秒完成标志
-            timer_3s_running = 0; // 停止计时
-        }
-    }
-}
-
-/************************* 3秒计时器控制函数 *************************/
-// 启动3秒计时器
-void Start_Timer3s(void)
-{
-    timer_3s_running = true;
-    TR0 = 1; // 启动定时器0
-}
-
-// 停止3秒计时器
-void Stop_Timer3s(void)
-{
-    timer_3s_running = false;
-    TR0 = 0; // 停止定时器0
-}
-
-// 重置3秒计时器
-void Reset_Timer3s(void)
-{
-    timer_3s_cnt = 0;
-    timer_3s_flag = 0;
-    timer_3s_running = false;
-}
-
-/************************* 其他函数实现 *************************/
-// 串口1初始化（115200波特率）
-void UART1_Init(void)
-{
-    SCON = 0x50;                  
-    AUXR |= 0x40; 
-    AUXR &= 0xFE; 
-    TMOD &= 0x0F;
-    TL1 = 0xCC;
-    TH1 = 0xFF;
-    ET1 = 0;
-    TR1 = 1;
-    EA = 1;       
-}
-
-// 系统初始化
+/************************* 函数实现 *************************/
+// 系统初始化：IO/中断/ADC/LVD + 调试模式串口初始化
 void System_Init(void)
 {
-    // IO模式配置
-    P3M0 &= ~0xfc; P3M1 |= 0xfc;  // P3.2-P3.7高阻输入
-    P1M0 &= ~0xbc; P1M1 = (P1M1 & ~0xa0) | 0x1c; // P1.4输入，P1.5/1.7输出
-    P5M0 = (P5M0 & ~0x10) | 0x20; P5M1 &= ~0x30; // P5.4/5.5推挽输出
+    // 1. IO口模式配置
+    // P3口：P3.2-P3.7 高阻输入；P3.0(RX1)/P3.1(TX1) 串口复用（调试模式）
+    P3M0 &= ~0xFC;
+    P3M1 |= 0xFC;
     
-    // 输出口默认高电平
-    SET_POWER(1);
+    // P1口：P12.-P1.4 高阻输入；P1.5/P1.7 推挽输出（PxM0=1, PxM1=0）
+    P1M0 = (P1M0 & ~0x5c) | 0xa0; 
+    P1M1 = (P1M1 & ~0xa0) | 0x5c; 
+
+    
+    // P5口：P5.4/P5.5 推挽输出（PxM0=1, PxM1=0）
+    P5M0 |= 0x30;
+    P5M1 &= ~0x30;
+    
+    // 2. 输出口初始化
     KEY1_OUT = 1;
     KEY2_OUT = 1;
     KEY3_OUT = 1;
     
-    // 中断配置
-    IT0 = 1;  // INT0下降沿触发
-    IT1 = 1;  // INT1上升沿触发
-    EX0 = 1;  // 开启INT0
-    EX1 = 1;  // 开启INT1
-    EA = 1;   // 总中断开启
-}
-
-// LVD+ADC初始化
-void LVD_ADC_Init(void)
-{
-    P1ASF = 0x00;               
-    ADC_CONTR = 0x80;           
-    ADC_RES = 0;                
-    ADC_RESL = 0;
-    Delay_ms(2);                
-    ADC_CONTR |= 0x0F;          
-    IE2 |= 0x80; 
-    LVDCR = 0x00;               
-    LVDCR |= (0b100 << 1);      
-    LVDCR |= 0x01;              
-    PCON &= ~LVDF;              
-}
-
-// 毫秒延时函数
-void Delay_ms(uint16_t ms)
-{
-    uint16_t i, j;
-    for(i = ms; i > 0; i--)
-        for(j = 2475; j > 0; j--);
-}
-
-// 进入掉电模式
-void Enter_PowerDown_Mode(void)
-{
-    PCON |= 0x02; 
-    NOP();        
-}
-
-// 串口发送电压值
-void UART1_Send_Voltage(uint16_t volt)
-{
-    uint8_t buf[16];
-    buf[0] = 'V'; buf[1] = 'C'; buf[2] = 'C'; buf[3] = ':';
-    buf[4] = volt / 1000 + '0';
-    buf[5] = (volt % 1000) / 100 + '0';
-    buf[6] = (volt % 100) / 10 + '0';
-    buf[7] = volt % 10 + '0';
-    buf[8] = 'm'; buf[9] = 'V'; buf[10] = '\r'; buf[11] = '\n'; buf[12] = '\0';
+    // 3. 电源初始化（预定义形式控制）
+#ifdef DEBUG_MODE
+    POWER_CTRL = POWER_ON_LEVEL;  // 调试模式：P5.5初始化为低（电源常开）
+    UART1_Init();                 // 调试模式：初始化串口1（115200波特率）
+#else
+    POWER_CTRL = POWER_OFF_LEVEL; // 非调试模式：P5.5初始化为高（电源关闭）
+#endif
     
-    // 串口发送字符串
-    uint8_t *p = buf;
-    while(*p != '\0')
+    // 4. 中断配置
+    IT0 = 1;  // INT0（P3.2）下降沿触发（预留）
+    IT1 = 1;  // INT1（P3.3）上升沿触发（核心唤醒源）
+    EX0 = 1;  // 开启INT0（预留）
+    EX1 = 1;  // 开启INT1
+    EA = 1;   // 开启总中断
+    
+    // 5. ADC+LVD初始化
+    LVD_ADC_Init();
+}
+
+// 定时器0初始化：1T模式，1ms中断一次（24MHz晶振）
+void Timer0_Init(void)
+{
+    TMOD &= 0xF0;               // 清除定时器0模式位
+    TMOD |= 0x01;               // 定时器0模式1（16位）
+    AUXR |= 0x80;               // 定时器0使用1T模式（STC8G特有）
+    
+    // 设置定时器重载值（1ms中断）
+    TH0 = (uint8_t)(TIMER0_RELOAD >> 8);
+    TL0 = (uint8_t)TIMER0_RELOAD;
+
+    TF0 = 0;                     // 清除溢出标志
+    ET0 = 1;                    // 开启定时器0中断
+    TR0 = 1;                    // 启动定时器0
+    EA = 1;                     // 开启总中断
+}
+
+// 串口1初始化（仅调试模式编译）：115200波特率，8N1，24MHz晶振
+#ifdef DEBUG_MODE
+void UART1_Init(void)
+{
+    SCON = 0x50;                // 8位数据，可变波特率
+    AUXR |= 0x01;               // 串口1使用定时器2作为波特率发生器
+    AUXR |= 0x04;               // 定时器2为1T模式
+    T2L = 0xCC;                 // 波特率重载值低8位
+    T2H = 0xFF;                 // 波特率重载值高8位
+    AUXR |= 0x10;               // 启动定时器2
+    ES = 1;                     // 开启串口1中断（可选，此处仅发送无需中断）
+}
+
+// 串口1发送单个字符
+void UART1_SendChar(uint8_t ch)
+{
+    SBUF = ch;
+    while(!TI);                 // 等待发送完成
+    TI = 0;                     // 清除发送标志
+}
+
+// 串口1发送字符串
+void UART1_SendString(char *str)
+{
+    while(*str != '\0')
     {
-        SBUF = *p;
-        while(!TI);
-        TI = 0;
-        p++;
+        UART1_SendChar(*str++);
     }
 }
 
-// 获取VCC电压
+// 串口打印电压值（格式：VCC Voltage: XXXX mV\r\n）
+void Print_Voltage(uint16_t volt)
+{
+    char buf[32];
+    // 格式化电压字符串
+    sprintf(buf, "VCC Voltage: %d mV\r\n", volt);
+    // 发送字符串
+    UART1_SendString(buf);
+}
+#endif
+
+// LVD+ADC初始化（CH15通道：内部参考电压）
+void LVD_ADC_Init(void)
+{
+    P1ASF = 0x00;               // P1口不作为ADC输入
+    ADC_CONTR = 0x80;           // 开启ADC电源（ADON=1）
+    ADC_RES = 0;                // 清空ADC结果寄存器
+    ADC_RESL = 0;
+    Timer_Delay_ms(2);          // ADC电源稳定延时（定时器实现）
+    ADC_CONTR |= 0x0F;          // 选择CH15通道
+    IE2 |= 0x80;                // 开启LVD中断允许位
+    
+    // LVD配置（3V阈值）
+    LVDCR = 0x00;               // 清空配置
+    LVDCR |= (0b100 << 1);      // LVD阈值3.0V
+    LVDCR |= 0x01;              // 开启LVD检测
+    PCON &= ~LVDF;              // 清除LVD中断标志
+}
+
+// 看门狗初始化：溢出时间≈1秒（STC8G1K17，24MHz晶振）
+void WDT_Init(void)
+{
+    WDTCN = 0x00;               // 解锁看门狗寄存器
+    WDTCN = 0x80;               // 启用看门狗（溢出时间≈1秒）
+}
+
+// 看门狗喂狗：重置看门狗计数器
+void WDT_Feed(void)
+{
+    WDTCN = 0x00;               // 解锁看门狗寄存器
+    WDTCN = 0xAA;               // 喂狗指令
+}
+
+// 关闭看门狗
+void WDT_Stop(void)
+{
+    WDTCN = 0x00;               // 解锁看门狗寄存器
+    WDTCN = 0xDE;               // 关闭看门狗
+}
+
+// 阻塞式毫秒延时函数（基于定时器0，精准无阻塞）
+void Timer_Delay_ms(uint16_t ms)
+{
+    uint32_t start_ms = timer_ms; // 记录延时开始时间
+    // 等待计时达到指定毫秒数（差值判断避免溢出）
+    while((timer_ms - start_ms) < ms);
+}
+
+// 进入掉电模式（仅P3.3上升沿中断可唤醒）
+void Enter_PowerDown_Mode(void)
+{
+    // 关闭定时器0，降低功耗
+    TR0 = 0;
+    ET0 = 0;
+    
+    // 关闭所有中断（仅保留INT1中断用于唤醒）
+    EA = 0;
+    EX0 = 0;
+    IE2 &= ~0x80; // 关闭LVD中断
+#ifdef DEBUG_MODE
+    ES = 0;       // 调试模式：关闭串口中断
+#endif
+    EX1 = 1;      // 保留INT1中断
+    
+    // 置位PD位进入掉电模式，等待INT1中断唤醒
+    PCON |= 0x02;
+    NOP();
+    NOP();
+    
+    // 唤醒后恢复定时器和中断
+    ET0 = 1;
+    TR0 = 1;
+    EA = 1;
+    EX0 = 1;
+    IE2 |= 0x80;
+#ifdef DEBUG_MODE
+    ES = 1;       // 调试模式：恢复串口中断
+#endif
+}
+
+// 获取VCC电压（单位：mV）
 uint16_t Get_VCC_Voltage(void)
 {
     uint16_t adc_val, voltage;
-    ADC_CONTR |= 0x40;          
-    while(!(ADC_CONTR & 0x20)); 
-    ADC_CONTR &= ~0x20;         
     
+    ADC_CONTR |= 0x40;          // 启动ADC转换
+    while(!(ADC_CONTR & 0x20)); // 等待转换完成
+    ADC_CONTR &= ~0x20;         // 清除转换完成标志
+    
+    // 计算12位ADC值
     adc_val = (uint16_t)ADC_RES << 4;
     adc_val |= ADC_RESL & 0x0F;
     
+    // 电压计算公式：VCC = 参考电压 * 4096 / ADC值（除零保护）
     if(adc_val != 0)
     {
         voltage = (uint32_t)REF_VOLTAGE * 4096 / adc_val;
     }
     else
     {
-        voltage = 0;
+        voltage = 0; // 异常值处理
     }
+    
     return voltage;
 }
 
-// 检测电压状态
+// 检测电压状态并更新高低标记（调试模式串口输出电压值）
 void Detect_Voltage_Status(void)
 {
     uint16_t volt = Get_VCC_Voltage();
+    
+    // 更新电压标记
     if(volt < VOLTAGE_THRESHOLD)
     {
         voltage_low_flag = 1;
@@ -384,88 +464,118 @@ void Detect_Voltage_Status(void)
         voltage_low_flag = 0;
         voltage_high_flag = 1;
     }
+    
+    // 调试模式：串口输出电压值
+#ifdef DEBUG_MODE
+    Print_Voltage(volt);
+#endif
 }
 
-// Key1输出0.1秒低脉冲
+// Key1输出0.05秒低脉冲（定时器延时）
 void Output_Key1_Pulse(void)
 {
     KEY1_OUT = 0;
-    Delay_ms(DELAY_0_1S);
+    Timer_Delay_ms(DELAY_KEY_PULSE);
     KEY1_OUT = 1;
 }
 
-// Key2输出0.1秒低脉冲
+// Key2输出0.05秒低脉冲（定时器延时）
 void Output_Key2_Pulse(void)
 {
     KEY2_OUT = 0;
-    Delay_ms(DELAY_0_1S);
+    Timer_Delay_ms(DELAY_KEY_PULSE);
     KEY2_OUT = 1;
 }
 
-// Key3输出0.5秒低脉冲
+// Key3输出0.05秒低脉冲（定时器延时）
 void Output_Key3_Pulse(void)
 {
     KEY3_OUT = 0;
-    Delay_ms(DELAY_0_5S);
+    Timer_Delay_ms(DELAY_KEY_PULSE);
     KEY3_OUT = 1;
 }
 
-// 检测Relay1状态
-bool Check_Relay1_Status(void)
+// 检测LED1状态（1=亮，0=灭）
+bool Check_LED1_Status(void)
 {
-    return (RELAY1_FEEDBACK == RELAY1_OPEN_LEVEL) ? 1 : 0;
+    return (LED1_STATUS == LED_ON_LEVEL) ? 1 : 0;
 }
 
-// 检测Relay2状态
-bool Check_Relay2_Status(void)
+// 检测LED2状态（1=亮，0=灭）
+bool Check_LED2_Status(void)
 {
-    return (LED2 == RELAY2_OPEN_LEVEL) ? 1 : 0;
+    return (LED2_STATUS == LED_ON_LEVEL) ? 1 : 0;
 }
 
-// 检测Relay3状态
+// 检测Relay3状态（1=打开，0=关闭）
 bool Check_Relay3_Status(void)
 {
     return (RELAY3_FEEDBACK == RELAY3_OPEN_LEVEL) ? 1 : 0;
 }
 
-// 禁用INT1中断
+// 禁用INT1中断（P3.3）- 防重复触发
 void Disable_INT1(void)
 {
     EX1 = 0;
 }
 
-// 启用INT1中断
+// 启用INT1中断（P3.3）- 恢复唤醒能力
 void Enable_INT1(void)
 {
     EX1 = 1;
 }
 
-// 检查掉电条件
+// 检查掉电条件：P3.2（无人）+ P3.3（无PIR）均低
 bool Check_Exit_Condition(void)
 {
-    //return (HUMAN_2410S_IN == 0 && PIR_IN == 0) ? true : false;
-    return (LED1==1 && LED2==1)? true : false;
+    return (HUMAN_2410S_IN == 0 && PIR_IN == 0) ? true : false;
 }
 
 /************************* 中断服务函数 *************************/
-// INT1中断（P3.3上升沿）
+// 定时器0中断服务函数（1ms一次）
+void Timer0_ISR(void) __interrupt(1)
+{
+    // 重装定时器初值（模式1需要手动重装）
+    TH0 = (uint8_t)(TIMER0_RELOAD >> 8);
+    TL0 = (uint8_t)TIMER0_RELOAD;
+    
+    timer_ms++; // 毫秒计数器累加
+}
+
+// INT1中断（P3.3上升沿）- 核心唤醒源
 void INT1_ISR(void) __interrupt(2)
 {
-    system_wakeup_flag = 1;
+    system_wakeup_flag = 1; // 置位唤醒标志
+    PCON &= ~0x02;          // 清除掉电模式标志，退出掉电
 }
 
-// INT0中断（P3.2下降沿）
+// INT0中断（P3.2下降沿）- 预留扩展
 void INT0_ISR(void) __interrupt(0)
 {
-    // 预留扩展
+    // 预留，暂无操作
 }
 
-// LVD中断
+// LVD中断服务函数 - 预留扩展
 void LVD_ISR(void) __interrupt(26)
 {
     if(PCON & LVDF)
     {
-        voltage_low_flag = 1;
-        PCON &= ~LVDF;
+        voltage_low_flag = 1; // 标记低电压
+        PCON &= ~LVDF;        // 清除中断标志
     }
 }
+
+// 串口1中断服务函数（仅调试模式编译，此处仅发送无需处理接收）
+#ifdef DEBUG_MODE
+void UART1_ISR(void) __interrupt(4)
+{
+    if(RI) // 接收中断（预留）
+    {
+        RI = 0; // 清除接收标志
+    }
+    if(TI) // 发送中断（自动清除，此处预留）
+    {
+        TI = 0;
+    }
+}
+#endif
